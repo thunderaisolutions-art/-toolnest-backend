@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-yt-dlp>=2025.1.1
+yt-dlp
 PyMuPDF
 rembg
 Pillow
