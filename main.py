@@ -4,8 +4,8 @@ from fastapi.responses import FileResponse
 import yt_dlp
 import uuid
 import os
+import shutil
 import subprocess
-import tempfile
 
 app = FastAPI()
 
@@ -16,9 +16,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─── ffmpeg detection ─────────────────────────────────────────────────────────
+# Nix puts ffmpeg in a non-standard path; find it once at startup.
+
+FFMPEG_PATH = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
+print(f"[startup] ffmpeg resolved to: {FFMPEG_PATH}")
+
+
 # ─── Cookies Setup ────────────────────────────────────────────────────────────
-# Set YOUTUBE_COOKIES env var on Railway with the full contents of cookies.txt
-# The file is written once at startup and reused for all yt-dlp calls.
 
 COOKIES_PATH = "/tmp/yt_cookies.txt"
 
@@ -31,7 +36,6 @@ def _setup_cookies():
 _setup_cookies()
 
 def _cookies_opt() -> dict:
-    """Return cookiefile opt only if the file exists and is non-empty."""
     if os.path.exists(COOKIES_PATH) and os.path.getsize(COOKIES_PATH) > 0:
         return {"cookiefile": COOKIES_PATH}
     return {}
@@ -41,23 +45,34 @@ def _cookies_opt() -> dict:
 
 @app.get("/")
 def root():
-    return {"status": "Vexora Tools Backend Running"}
+    return {
+        "status": "Vexora Tools Backend Running",
+        "ffmpeg": FFMPEG_PATH,
+    }
 
 
 # ─── Shared helpers ───────────────────────────────────────────────────────────
 
 def _tmp(ext: str) -> str:
-    """Return a unique /tmp path with the given extension."""
     return f"/tmp/{uuid.uuid4()}.{ext}"
 
 
-def _extract_info(url: str, ydl_opts: dict = None) -> dict:
-    opts = {"quiet": True, "noplaylist": True, **_cookies_opt(), **(ydl_opts or {})}
+def _base_opts() -> dict:
+    """Common yt-dlp options injected into every call."""
+    return {
+        "quiet": True,
+        "ffmpeg_location": FFMPEG_PATH,
+        **_cookies_opt(),
+    }
+
+
+def _extract_info(url: str, extra: dict = None) -> dict:
+    opts = {"noplaylist": True, **_base_opts(), **(extra or {})}
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
 
-# ─── 1. Video Info  (YouTube · TikTok · Instagram · Twitter/X · Facebook) ────
+# ─── 1. Video Info ────────────────────────────────────────────────────────────
 
 @app.get("/video-info")
 def video_info(url: str):
@@ -96,9 +111,8 @@ def video_info(url: str):
     audio_fmts = [f for f in formats if f["resolution"] == "audio only"]
 
     def _height(fmt):
-        res = fmt["resolution"]
         try:
-            return int(res.split("x")[-1])
+            return int(fmt["resolution"].split("x")[-1])
         except Exception:
             return 0
 
@@ -120,15 +134,14 @@ def video_info(url: str):
 def download(url: str, format_id: str):
     out_tmpl = f"/tmp/{uuid.uuid4()}.%(ext)s"
     ydl_opts = {
-        "format":  f"{format_id}+bestaudio[ext=m4a]/bestaudio/{format_id}",
+        **_base_opts(),
+        "format":  f"{format_id}+bestaudio[ext=m4a]/bestaudio/{format_id}/{format_id}",
         "outtmpl": out_tmpl,
-        "quiet":   True,
         "merge_output_format": "mp4",
         "postprocessors": [{
             "key": "FFmpegVideoConvertor",
             "preferedformat": "mp4",
         }],
-        **_cookies_opt(),
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -137,21 +150,15 @@ def download(url: str, format_id: str):
             if not os.path.exists(filepath):
                 base = os.path.splitext(filepath)[0]
                 for ext in ("mp4", "webm", "mkv"):
-                    candidate = f"{base}.{ext}"
-                    if os.path.exists(candidate):
-                        filepath = candidate
+                    if os.path.exists(f"{base}.{ext}"):
+                        filepath = f"{base}.{ext}"
                         break
     except yt_dlp.utils.DownloadError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
     safe_title = "".join(c for c in info.get("title", "video") if c.isalnum() or c in " _-")
     ext        = os.path.splitext(filepath)[-1].lstrip(".")
-
-    return FileResponse(
-        filepath,
-        filename=f"{safe_title}.{ext}",
-        media_type="application/octet-stream",
-    )
+    return FileResponse(filepath, filename=f"{safe_title}.{ext}", media_type="application/octet-stream")
 
 
 # ─── 3. Audio / MP3 Download ─────────────────────────────────────────────────
@@ -160,23 +167,22 @@ def download(url: str, format_id: str):
 def audio_download(url: str):
     out_path = _tmp("%(ext)s")
     ydl_opts = {
+        **_base_opts(),
         "format":  "bestaudio/best",
         "outtmpl": out_path,
-        "quiet":   True,
         "postprocessors": [{
-            "key":            "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
+            "key":              "FFmpegExtractAudio",
+            "preferredcodec":   "mp3",
             "preferredquality": "192",
         }],
-        **_cookies_opt(),
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
+            base = os.path.splitext(ydl.prepare_filename(info))[0]
     except yt_dlp.utils.DownloadError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    base     = os.path.splitext(ydl.prepare_filename(info))[0]
     filepath = f"{base}.mp3"
     if not os.path.exists(filepath):
         raise HTTPException(status_code=500, detail="MP3 conversion failed.")
@@ -196,10 +202,9 @@ def video_to_gif(url: str, start: float = 0, duration: float = 5, width: int = 4
 
     src_path = _tmp("mp4")
     ydl_opts = {
+        **_base_opts(),
         "format":  "bestvideo[height<=720][ext=mp4]/bestvideo[height<=720]/best[height<=720]",
         "outtmpl": src_path,
-        "quiet":   True,
-        **_cookies_opt(),
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -215,14 +220,14 @@ def video_to_gif(url: str, start: float = 0, duration: float = 5, width: int = 4
 
     try:
         subprocess.run([
-            "ffmpeg", "-y",
+            FFMPEG_PATH, "-y",
             "-ss", str(start), "-t", str(duration), "-i", src,
             "-vf", f"fps=12,scale={width}:-1:flags=lanczos,palettegen",
             palette_path,
         ], check=True, capture_output=True)
 
         subprocess.run([
-            "ffmpeg", "-y",
+            FFMPEG_PATH, "-y",
             "-ss", str(start), "-t", str(duration), "-i", src,
             "-i", palette_path,
             "-filter_complex", f"fps=12,scale={width}:-1:flags=lanczos[x];[x][1:v]paletteuse",
@@ -241,17 +246,15 @@ def video_to_gif(url: str, start: float = 0, duration: float = 5, width: int = 4
 def video_trim(url: str, start: float = 0, end: float = 30):
     if end <= start:
         raise HTTPException(status_code=400, detail="end must be greater than start.")
-    duration = end - start
-    if duration > 600:
+    if (end - start) > 600:
         raise HTTPException(status_code=400, detail="Maximum clip length is 10 minutes.")
 
     src_path = _tmp("mp4")
     ydl_opts = {
+        **_base_opts(),
         "format":  "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "outtmpl": src_path,
-        "quiet":   True,
         "merge_output_format": "mp4",
-        **_cookies_opt(),
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -269,7 +272,7 @@ def video_trim(url: str, start: float = 0, end: float = 30):
     out_mp4 = _tmp("mp4")
     try:
         subprocess.run([
-            "ffmpeg", "-y",
+            FFMPEG_PATH, "-y",
             "-ss", str(start), "-to", str(end),
             "-i", src,
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
