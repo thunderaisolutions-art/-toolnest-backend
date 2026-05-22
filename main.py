@@ -16,6 +16,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─── Cookies Setup ────────────────────────────────────────────────────────────
+# Set YOUTUBE_COOKIES env var on Railway with the full contents of cookies.txt
+# The file is written once at startup and reused for all yt-dlp calls.
+
+COOKIES_PATH = "/tmp/yt_cookies.txt"
+
+def _setup_cookies():
+    raw = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    if raw:
+        with open(COOKIES_PATH, "w") as f:
+            f.write(raw)
+
+_setup_cookies()
+
+def _cookies_opt() -> dict:
+    """Return cookiefile opt only if the file exists and is non-empty."""
+    if os.path.exists(COOKIES_PATH) and os.path.getsize(COOKIES_PATH) > 0:
+        return {"cookiefile": COOKIES_PATH}
+    return {}
+
+
 # ─── Health ───────────────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -31,17 +52,12 @@ def _tmp(ext: str) -> str:
 
 
 def _extract_info(url: str, ydl_opts: dict = None) -> dict:
-    opts = {"quiet": True, "noplaylist": True, **(ydl_opts or {})}
+    opts = {"quiet": True, "noplaylist": True, **_cookies_opt(), **(ydl_opts or {})}
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
 
 # ─── 1. Video Info  (YouTube · TikTok · Instagram · Twitter/X · Facebook) ────
-#
-#  GET /video-info?url=<url>
-#
-#  Returns title, thumbnail, duration, uploader, and a de-duplicated list of
-#  downloadable formats sorted best-first (highest resolution at top).
 
 @app.get("/video-info")
 def video_info(url: str):
@@ -53,16 +69,13 @@ def video_info(url: str):
     seen_res: set = set()
     formats = []
 
-    # Walk formats in reverse so the highest-quality entries come first after
-    # de-duplication by resolution label.
     for f in reversed(info.get("formats", [])):
-        res   = f.get("resolution") or "audio only"
-        ext   = f.get("ext", "")
+        res    = f.get("resolution") or "audio only"
+        ext    = f.get("ext", "")
         vcodec = f.get("vcodec", "none")
         acodec = f.get("acodec", "none")
-        fid   = f.get("format_id", "")
+        fid    = f.get("format_id", "")
 
-        # Keep video-bearing formats in mp4/webm and the best audio-only stream
         if vcodec == "none" and ext not in ("m4a", "mp3", "webm"):
             continue
         if vcodec != "none" and ext not in ("mp4", "webm"):
@@ -79,11 +92,9 @@ def video_info(url: str):
             "filesize":   f.get("filesize") or f.get("filesize_approx"),
         })
 
-    # Best-quality video first, audio-only entries at the bottom
     video_fmts = [f for f in formats if f["resolution"] != "audio only"]
     audio_fmts = [f for f in formats if f["resolution"] == "audio only"]
 
-    # Sort video formats by vertical pixel count (descending)
     def _height(fmt):
         res = fmt["resolution"]
         try:
@@ -96,19 +107,14 @@ def video_info(url: str):
     return {
         "title":     info.get("title", "video"),
         "thumbnail": info.get("thumbnail"),
-        "duration":  info.get("duration"),        # seconds
+        "duration":  info.get("duration"),
         "uploader":  info.get("uploader"),
         "platform":  info.get("extractor_key"),
         "formats":   video_fmts + audio_fmts,
     }
 
 
-# ─── 2. Video Download  (any platform, any format) ───────────────────────────
-#
-#  GET /download?url=<url>&format_id=<id>
-#
-#  Downloads the requested format and streams it back as a file.
-#  If the chosen format has no audio, yt-dlp merges the best audio in.
+# ─── 2. Video Download ────────────────────────────────────────────────────────
 
 @app.get("/download")
 def download(url: str, format_id: str):
@@ -117,18 +123,17 @@ def download(url: str, format_id: str):
         "format":  f"{format_id}+bestaudio[ext=m4a]/bestaudio/{format_id}",
         "outtmpl": out_tmpl,
         "quiet":   True,
-        # Merge into mp4 when yt-dlp selects two separate streams
         "merge_output_format": "mp4",
         "postprocessors": [{
             "key": "FFmpegVideoConvertor",
             "preferedformat": "mp4",
         }],
+        **_cookies_opt(),
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info     = ydl.extract_info(url, download=True)
             filepath = ydl.prepare_filename(info)
-            # After merge, extension may have changed to .mp4
             if not os.path.exists(filepath):
                 base = os.path.splitext(filepath)[0]
                 for ext in ("mp4", "webm", "mkv"):
@@ -150,10 +155,6 @@ def download(url: str, format_id: str):
 
 
 # ─── 3. Audio / MP3 Download ─────────────────────────────────────────────────
-#
-#  GET /audio-download?url=<url>
-#
-#  Extracts the best available audio and converts it to MP3 (192 kbps).
 
 @app.get("/audio-download")
 def audio_download(url: str):
@@ -167,6 +168,7 @@ def audio_download(url: str):
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }],
+        **_cookies_opt(),
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -174,8 +176,7 @@ def audio_download(url: str):
     except yt_dlp.utils.DownloadError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # yt-dlp always outputs .mp3 after the postprocessor
-    base = os.path.splitext(ydl.prepare_filename(info))[0]
+    base     = os.path.splitext(ydl.prepare_filename(info))[0]
     filepath = f"{base}.mp3"
     if not os.path.exists(filepath):
         raise HTTPException(status_code=500, detail="MP3 conversion failed.")
@@ -184,12 +185,7 @@ def audio_download(url: str):
     return FileResponse(filepath, filename=f"{safe_title}.mp3", media_type="audio/mpeg")
 
 
-# ─── 4. Video → GIF ──────────────────────────────────────────────────────────
-#
-#  GET /video-to-gif?url=<url>&start=<seconds>&duration=<seconds>&width=<px>
-#
-#  Downloads the source video then uses ffmpeg to produce an optimised GIF.
-#  Default: start=0, duration=5, width=480.
+# ─── 4. Video to GIF ─────────────────────────────────────────────────────────
 
 @app.get("/video-to-gif")
 def video_to_gif(url: str, start: float = 0, duration: float = 5, width: int = 480):
@@ -198,12 +194,12 @@ def video_to_gif(url: str, start: float = 0, duration: float = 5, width: int = 4
     if width > 1280:
         raise HTTPException(status_code=400, detail="Maximum GIF width is 1280 px.")
 
-    # 1. Download source video (fast — only what we need via yt-dlp)
     src_path = _tmp("mp4")
     ydl_opts = {
         "format":  "bestvideo[height<=720][ext=mp4]/bestvideo[height<=720]/best[height<=720]",
         "outtmpl": src_path,
         "quiet":   True,
+        **_cookies_opt(),
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -214,7 +210,6 @@ def video_to_gif(url: str, start: float = 0, duration: float = 5, width: int = 4
     except yt_dlp.utils.DownloadError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # 2. Generate palette then apply it (two-pass for quality)
     palette_path = _tmp("png")
     out_gif      = _tmp("gif")
 
@@ -240,11 +235,7 @@ def video_to_gif(url: str, start: float = 0, duration: float = 5, width: int = 4
     return FileResponse(out_gif, filename=f"{safe_title}.gif", media_type="image/gif")
 
 
-# ─── 5. Video Trimmer ─────────────────────────────────────────────────────────
-#
-#  GET /video-trim?url=<url>&start=<seconds>&end=<seconds>
-#
-#  Downloads the video then re-encodes the requested segment as MP4.
+# ─── 5. Video Trimmer ────────────────────────────────────────────────────────
 
 @app.get("/video-trim")
 def video_trim(url: str, start: float = 0, end: float = 30):
@@ -254,20 +245,19 @@ def video_trim(url: str, start: float = 0, end: float = 30):
     if duration > 600:
         raise HTTPException(status_code=400, detail="Maximum clip length is 10 minutes.")
 
-    # Download source
     src_path = _tmp("mp4")
     ydl_opts = {
         "format":  "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "outtmpl": src_path,
         "quiet":   True,
         "merge_output_format": "mp4",
+        **_cookies_opt(),
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             src  = ydl.prepare_filename(info)
             if not os.path.exists(src):
-                # After merge, extension may differ
                 base = os.path.splitext(src)[0]
                 for ext in ("mp4", "mkv", "webm"):
                     if os.path.exists(f"{base}.{ext}"):
