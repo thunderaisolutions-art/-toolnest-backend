@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import base64
+import glob
 
 app = FastAPI()
 
@@ -17,20 +18,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ffmpeg detection
-FFMPEG_PATH = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
-print(f"[startup] ffmpeg resolved to: {FFMPEG_PATH}")
+
+# ffmpeg detection — searches nix store paths Railway uses
+def _find_ffmpeg() -> str:
+    # 1. Standard PATH lookup
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    # 2. Common static install paths
+    for path in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/bin/ffmpeg"]:
+        if os.path.isfile(path):
+            return path
+    # 3. Nix store — Railway/nixpacks installs here
+    nix_hits = glob.glob("/nix/store/*/bin/ffmpeg")
+    if nix_hits:
+        return nix_hits[0]
+    # 4. Ask the shell directly
+    try:
+        result = subprocess.run(
+            ["bash", "-c", "command -v ffmpeg"],
+            capture_output=True, text=True
+        )
+        path = result.stdout.strip()
+        if path:
+            return path
+    except Exception:
+        pass
+    return "ffmpeg"  # last resort — let it fail with a clear error
+
+FFMPEG_PATH = _find_ffmpeg()
+FFMPEG_OK   = os.path.isfile(FFMPEG_PATH)
+print(f"[startup] ffmpeg resolved to: {FFMPEG_PATH} (ok={FFMPEG_OK})")
 
 
 # Cookies Setup
-# Supports two env vars:
-#   YOUTUBE_COOKIES_B64  ->  base64-encoded Netscape cookie file (PREFERRED, handles newlines in Railway)
-#   YOUTUBE_COOKIES      ->  raw Netscape cookie file content (fallback)
+# YOUTUBE_COOKIES_B64  ->  base64-encoded Netscape cookie file (PREFERRED)
+# YOUTUBE_COOKIES      ->  raw Netscape cookie file content (fallback)
 
 COOKIES_PATH = "/tmp/yt_cookies.txt"
 
 def _setup_cookies():
-    # Try base64 first (most reliable in Railway env vars)
     raw_b64 = os.environ.get("YOUTUBE_COOKIES_B64", "").strip()
     if raw_b64:
         try:
@@ -42,7 +69,6 @@ def _setup_cookies():
         except Exception as e:
             print(f"[startup] Failed to decode base64 cookies: {e}")
 
-    # Fallback: raw cookie content
     raw = os.environ.get("YOUTUBE_COOKIES", "").strip()
     if raw:
         with open(COOKIES_PATH, "w") as f:
@@ -50,7 +76,7 @@ def _setup_cookies():
         print(f"[startup] Cookies loaded from YOUTUBE_COOKIES ({len(raw)} bytes)")
         return
 
-    print("[startup] WARNING: No YouTube cookies set. Bot detection WILL block downloads.")
+    print("[startup] WARNING: No YouTube cookies set.")
 
 _setup_cookies()
 
@@ -66,8 +92,9 @@ def _cookies_opt() -> dict:
 def root():
     cookies_loaded = os.path.exists(COOKIES_PATH) and os.path.getsize(COOKIES_PATH) > 0
     return {
-        "status": "Vexora Tools Backend Running",
-        "ffmpeg": FFMPEG_PATH,
+        "status":  "Vexora Tools Backend Running",
+        "ffmpeg":  FFMPEG_PATH,
+        "ffmpeg_ok": FFMPEG_OK,
         "cookies": "loaded" if cookies_loaded else "MISSING - set YOUTUBE_COOKIES_B64 in Railway",
     }
 
@@ -79,11 +106,13 @@ def _tmp(ext: str) -> str:
 
 
 def _base_opts() -> dict:
-    return {
+    opts = {
         "quiet": True,
-        "ffmpeg_location": FFMPEG_PATH,
         **_cookies_opt(),
     }
+    if FFMPEG_OK:
+        opts["ffmpeg_location"] = FFMPEG_PATH
+    return opts
 
 
 def _extract_info(url: str, extra: dict = None) -> dict:
@@ -153,16 +182,28 @@ def video_info(url: str):
 @app.get("/download")
 def download(url: str, format_id: str):
     out_tmpl = f"/tmp/{uuid.uuid4()}.%(ext)s"
-    ydl_opts = {
-        **_base_opts(),
-        "format":  f"{format_id}+bestaudio[ext=m4a]/bestaudio/{format_id}/{format_id}",
-        "outtmpl": out_tmpl,
-        "merge_output_format": "mp4",
-        "postprocessors": [{
+
+    if FFMPEG_OK:
+        # ffmpeg present: download best video + best audio and merge into mp4
+        fmt = f"{format_id}+bestaudio[ext=m4a]/bestaudio/{format_id}/{format_id}"
+        postprocessors = [{
             "key": "FFmpegVideoConvertor",
             "preferedformat": "mp4",
-        }],
+        }]
+        merge_fmt = "mp4"
+    else:
+        # ffmpeg missing: request a pre-merged single-file format only
+        fmt = f"{format_id}/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        postprocessors = []
+        merge_fmt = None
+
+    ydl_opts = {
+        **_base_opts(),
+        "format":  fmt,
+        "outtmpl": out_tmpl,
+        **({"merge_output_format": merge_fmt, "postprocessors": postprocessors} if merge_fmt else {}),
     }
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info     = ydl.extract_info(url, download=True)
@@ -186,15 +227,24 @@ def download(url: str, format_id: str):
 @app.get("/audio-download")
 def audio_download(url: str):
     out_path = _tmp("%(ext)s")
-    ydl_opts = {
-        **_base_opts(),
-        "format":  "bestaudio/best",
-        "outtmpl": out_path,
-        "postprocessors": [{
+
+    if FFMPEG_OK:
+        postprocessors = [{
             "key":              "FFmpegExtractAudio",
             "preferredcodec":   "mp3",
             "preferredquality": "192",
-        }],
+        }]
+        fmt = "bestaudio/best"
+    else:
+        # Without ffmpeg, grab a pre-encoded mp3/m4a directly
+        postprocessors = []
+        fmt = "bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio/best"
+
+    ydl_opts = {
+        **_base_opts(),
+        "format":  fmt,
+        "outtmpl": out_path,
+        "postprocessors": postprocessors,
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -203,18 +253,22 @@ def audio_download(url: str):
     except yt_dlp.utils.DownloadError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    filepath = f"{base}.mp3"
-    if not os.path.exists(filepath):
-        raise HTTPException(status_code=500, detail="MP3 conversion failed.")
+    # Find what was actually downloaded
+    for candidate_ext in ("mp3", "m4a", "webm", "ogg"):
+        candidate = f"{base}.{candidate_ext}"
+        if os.path.exists(candidate):
+            safe_title = "".join(c for c in info.get("title", "audio") if c.isalnum() or c in " _-")
+            return FileResponse(candidate, filename=f"{safe_title}.{candidate_ext}", media_type="audio/mpeg")
 
-    safe_title = "".join(c for c in info.get("title", "audio") if c.isalnum() or c in " _-")
-    return FileResponse(filepath, filename=f"{safe_title}.mp3", media_type="audio/mpeg")
+    raise HTTPException(status_code=500, detail="Audio download failed — file not found after download.")
 
 
 # 4. Video to GIF
 
 @app.get("/video-to-gif")
 def video_to_gif(url: str, start: float = 0, duration: float = 5, width: int = 480):
+    if not FFMPEG_OK:
+        raise HTTPException(status_code=500, detail="ffmpeg is not available on this server.")
     if duration > 30:
         raise HTTPException(status_code=400, detail="Maximum GIF duration is 30 seconds.")
     if width > 1280:
@@ -264,6 +318,8 @@ def video_to_gif(url: str, start: float = 0, duration: float = 5, width: int = 4
 
 @app.get("/video-trim")
 def video_trim(url: str, start: float = 0, end: float = 30):
+    if not FFMPEG_OK:
+        raise HTTPException(status_code=500, detail="ffmpeg is not available on this server.")
     if end <= start:
         raise HTTPException(status_code=400, detail="end must be greater than start.")
     if (end - start) > 600:
