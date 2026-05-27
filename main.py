@@ -6,6 +6,7 @@ import uuid
 import os
 import shutil
 import subprocess
+import base64
 
 app = FastAPI()
 
@@ -16,22 +17,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── ffmpeg detection ─────────────────────────────────────────────────────────
+# ffmpeg detection
 FFMPEG_PATH = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 print(f"[startup] ffmpeg resolved to: {FFMPEG_PATH}")
 
 
-# ─── Cookies Setup ────────────────────────────────────────────────────────────
+# Cookies Setup
+# Supports two env vars:
+#   YOUTUBE_COOKIES_B64  ->  base64-encoded Netscape cookie file (PREFERRED, handles newlines in Railway)
+#   YOUTUBE_COOKIES      ->  raw Netscape cookie file content (fallback)
+
 COOKIES_PATH = "/tmp/yt_cookies.txt"
 
 def _setup_cookies():
+    # Try base64 first (most reliable in Railway env vars)
+    raw_b64 = os.environ.get("YOUTUBE_COOKIES_B64", "").strip()
+    if raw_b64:
+        try:
+            decoded = base64.b64decode(raw_b64).decode("utf-8")
+            with open(COOKIES_PATH, "w") as f:
+                f.write(decoded)
+            print(f"[startup] Cookies loaded from YOUTUBE_COOKIES_B64 ({len(decoded)} bytes)")
+            return
+        except Exception as e:
+            print(f"[startup] Failed to decode base64 cookies: {e}")
+
+    # Fallback: raw cookie content
     raw = os.environ.get("YOUTUBE_COOKIES", "").strip()
     if raw:
         with open(COOKIES_PATH, "w") as f:
             f.write(raw)
-        print(f"[startup] YouTube cookies loaded ({len(raw)} bytes)")
-    else:
-        print("[startup] No YOUTUBE_COOKIES env var found — running in cookieless mode (iOS/TV client)")
+        print(f"[startup] Cookies loaded from YOUTUBE_COOKIES ({len(raw)} bytes)")
+        return
+
+    print("[startup] WARNING: No YouTube cookies set. Bot detection WILL block downloads.")
 
 _setup_cookies()
 
@@ -41,7 +60,7 @@ def _cookies_opt() -> dict:
     return {}
 
 
-# ─── Health ───────────────────────────────────────────────────────────────────
+# Health
 
 @app.get("/")
 def root():
@@ -49,39 +68,22 @@ def root():
     return {
         "status": "Vexora Tools Backend Running",
         "ffmpeg": FFMPEG_PATH,
-        "cookies": "loaded" if cookies_loaded else "not set (using client bypass)",
+        "cookies": "loaded" if cookies_loaded else "MISSING - set YOUTUBE_COOKIES_B64 in Railway",
     }
 
 
-# ─── Shared helpers ───────────────────────────────────────────────────────────
+# Shared helpers
 
 def _tmp(ext: str) -> str:
     return f"/tmp/{uuid.uuid4()}.{ext}"
 
 
 def _base_opts() -> dict:
-    """
-    Common yt-dlp options for every call.
-
-    YouTube's bot-detection fires when yt-dlp uses the default 'web' player
-    client without cookies. Rotating through ios -> tv_embedded -> android_vr
-    uses clients YouTube doesn't enforce the sign-in wall on.
-    If cookies ARE available they're added on top as extra assurance.
-    """
-    opts = {
+    return {
         "quiet": True,
         "ffmpeg_location": FFMPEG_PATH,
-        # Use non-web player clients to bypass bot detection without cookies.
-        # yt-dlp tries each in order and falls back automatically.
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["ios", "tv_embedded", "android_vr"],
-            }
-        },
-        # Add cookies on top if available (belt-and-suspenders)
         **_cookies_opt(),
     }
-    return opts
 
 
 def _extract_info(url: str, extra: dict = None) -> dict:
@@ -90,7 +92,7 @@ def _extract_info(url: str, extra: dict = None) -> dict:
         return ydl.extract_info(url, download=False)
 
 
-# ─── 1. Video Info ────────────────────────────────────────────────────────────
+# 1. Video Info
 
 @app.get("/video-info")
 def video_info(url: str):
@@ -146,7 +148,7 @@ def video_info(url: str):
     }
 
 
-# ─── 2. Video Download ────────────────────────────────────────────────────────
+# 2. Video Download
 
 @app.get("/download")
 def download(url: str, format_id: str):
@@ -179,7 +181,7 @@ def download(url: str, format_id: str):
     return FileResponse(filepath, filename=f"{safe_title}.{ext}", media_type="application/octet-stream")
 
 
-# ─── 3. Audio / MP3 Download ─────────────────────────────────────────────────
+# 3. Audio / MP3 Download
 
 @app.get("/audio-download")
 def audio_download(url: str):
@@ -209,7 +211,7 @@ def audio_download(url: str):
     return FileResponse(filepath, filename=f"{safe_title}.mp3", media_type="audio/mpeg")
 
 
-# ─── 4. Video to GIF ─────────────────────────────────────────────────────────
+# 4. Video to GIF
 
 @app.get("/video-to-gif")
 def video_to_gif(url: str, start: float = 0, duration: float = 5, width: int = 480):
@@ -258,7 +260,7 @@ def video_to_gif(url: str, start: float = 0, duration: float = 5, width: int = 4
     return FileResponse(out_gif, filename=f"{safe_title}.gif", media_type="image/gif")
 
 
-# ─── 5. Video Trimmer ────────────────────────────────────────────────────────
+# 5. Video Trimmer
 
 @app.get("/video-trim")
 def video_trim(url: str, start: float = 0, end: float = 30):
