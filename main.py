@@ -17,14 +17,11 @@ app.add_middleware(
 )
 
 # ─── ffmpeg detection ─────────────────────────────────────────────────────────
-# Nix puts ffmpeg in a non-standard path; find it once at startup.
-
 FFMPEG_PATH = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 print(f"[startup] ffmpeg resolved to: {FFMPEG_PATH}")
 
 
 # ─── Cookies Setup ────────────────────────────────────────────────────────────
-
 COOKIES_PATH = "/tmp/yt_cookies.txt"
 
 def _setup_cookies():
@@ -32,6 +29,9 @@ def _setup_cookies():
     if raw:
         with open(COOKIES_PATH, "w") as f:
             f.write(raw)
+        print(f"[startup] YouTube cookies loaded ({len(raw)} bytes)")
+    else:
+        print("[startup] No YOUTUBE_COOKIES env var found — running in cookieless mode (iOS/TV client)")
 
 _setup_cookies()
 
@@ -45,9 +45,11 @@ def _cookies_opt() -> dict:
 
 @app.get("/")
 def root():
+    cookies_loaded = os.path.exists(COOKIES_PATH) and os.path.getsize(COOKIES_PATH) > 0
     return {
         "status": "Vexora Tools Backend Running",
         "ffmpeg": FFMPEG_PATH,
+        "cookies": "loaded" if cookies_loaded else "not set (using client bypass)",
     }
 
 
@@ -58,12 +60,28 @@ def _tmp(ext: str) -> str:
 
 
 def _base_opts() -> dict:
-    """Common yt-dlp options injected into every call."""
-    return {
+    """
+    Common yt-dlp options for every call.
+
+    YouTube's bot-detection fires when yt-dlp uses the default 'web' player
+    client without cookies. Rotating through ios -> tv_embedded -> android_vr
+    uses clients YouTube doesn't enforce the sign-in wall on.
+    If cookies ARE available they're added on top as extra assurance.
+    """
+    opts = {
         "quiet": True,
         "ffmpeg_location": FFMPEG_PATH,
+        # Use non-web player clients to bypass bot detection without cookies.
+        # yt-dlp tries each in order and falls back automatically.
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["ios", "tv_embedded", "android_vr"],
+            }
+        },
+        # Add cookies on top if available (belt-and-suspenders)
         **_cookies_opt(),
     }
+    return opts
 
 
 def _extract_info(url: str, extra: dict = None) -> dict:
